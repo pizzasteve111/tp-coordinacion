@@ -49,3 +49,21 @@ Terminan de esperar mensajes y mandan sus resultados a Join indicando "procese X
 
 Join va a mantener un seguimiento de todas las tareas que procesen los Aggs hasta que se llegue al máximo.
 
+# Tests:
+
+Para uno de cada uno se reciben los resultados esperados.
+
+## Test 2:
+
+Falla porque al no ser distribuido, todos los mensajes de los clientes se los juntan
+y se devuelve el resultado como si fuera uno solo.
+
+Solución: En el message handler, ademas de caso eof y expresar cuantas tareas de cada uno, indicar de quien es el EoF y las tareas de cada client.
+
+Las instancias sum o aggregator tienen que discernir el procesamiento para cada uno de los clients.
+
+En este caso me piden pasar todos los tests con una replica de cada elemento.
+
+Lo que priorizamos entonces es la persistencia en disco y dividir el procesamiento de acuerdo al client.
+
+Tanto el mensaje como EoF de message handler tiene que tener el id de client.
