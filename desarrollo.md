@@ -1,0 +1,51 @@
+Client no se puede modificar
+Gateway solo el message handler.
+
+En las inputs se mandan msjs, de las outputs se leen.
+
+Distribuimos Sum, tenemos varias instancias que son balanceadas por las working queue input que encola el gateway.
+De esa forma ya podes pasarle distintos fragmentos de cantidad a cada instancia.
+Sin embargo, solo una recibe el EoF, esto quizas haciendo un mecanismo de concurrencia con una barrier o condition.
+
+Cuando una sola recibe el EoF, se lo triggerea y se ponen todas las instancias en trabajo terminado.
+Otra sería tener una exchange queue que le llegue a todas las suscritas el mensaje de EoF y ahí terminar de procesar.
+
+Cada sum manda por su queue sus sumas de X frutas, luego estas tambien se distribuyen por la working queue hacia las instancias aggregator que hace el top
+cada una, esto lo mandan a la queue de Join. Aggregator puede recibir suma de cualquiera de las instancias de Sum.
+
+
+
+Join va a recibir los tops de los distintos aggregations y va a calcular su propio top y le responde al gateway.
+Por cuestiones de evitar multiples ejecuciones, lo ideal sería que el join de tops se haga una vez recibieron todos los mensajes de los aggregators.
+Entonces tiene que haber una forma de sincronización entre los N aggregators para que una vez que todos terminaron de comunicar a Join, se mande el mensaje EoF a Join
+
+Cuando Join lee este mensaje, sabe que tiene que procesar el top final y comuinicarlo a client.
+
+Si Join conoce la cantidad de aggregators, lo hace una vez
+
+
+Idea: Si puedo modificar el message handler, hacer que en cada serialización se indique el id y que en el EoF se indique la cantidad total de mensajes por cada client.
+
+
+Gateway no se puede modificar, invoca como queues solo working, asi que entiendo que como tal no es capaz de broadcastear.
+
+Se puede modificar el message Handler que usa gateway, hacemos que este mantena un seguimiento de las N porciones en las que se divide los mensajes del cliente.
+
+Cuando recibe EoF, manda por la working queue que hay N mensajes en total.
+
+El sum que reciba el EoF broadcastea a todas las workings que ya se terminó el flujo de mensajes desde gateway, que ya no deberían esperar mas mensajes.
+Entonces cada Sum ahora ya puede procesar todos sus datos y enviar el resultado a Agg, tanto sum como agg van guardando sus datos en un archivo para no tenerlo cargado en memoria.
+Cuando reciben el eof ahí lo itean(yield) y lo procesan.
+
+El mensaje de cada sum es:
+payload, X tareas completadas de N totales
+
+Entonces un aggregator sabe cuantas tareas ya procesó de las N que le pueden llegar.
+
+
+Un aggregator va recibiendo mensajes de Sums y va sumando cuantas tareas procesa de las N originales.
+Persisten sus datos en disco y cuando pasa X tiempo sin recibir mensajes, hacen un procesamiento y lo mandan a Join.
+Terminan de esperar mensajes y mandan sus resultados a Join indicando "procese X tareas de las 150" en total.
+
+Join va a mantener un seguimiento de todas las tareas que procesen los Aggs hasta que se llegue al máximo.
+

@@ -7,6 +7,7 @@ import (
 )
 
 type MessageHandler struct {
+	//añadimos total_tasks
 }
 
 func NewMessageHandler() MessageHandler {
@@ -14,11 +15,13 @@ func NewMessageHandler() MessageHandler {
 }
 
 func (messageHandler *MessageHandler) SerializeDataMessage(fruitRecord fruititem.FruitItem) (*middleware.Message, error) {
+	//aumentamos el total tasks por cada mensaje que serializamos para enviar
 	data := []fruititem.FruitItem{fruitRecord}
 	return inner.SerializeMessage(data)
 }
 
 func (messageHandler *MessageHandler) SerializeEOFMessage() (*middleware.Message, error) {
+	//no mandamos el data que es solo uina lista vacía, mandamos el total tasks
 	data := []fruititem.FruitItem{}
 	return inner.SerializeMessage(data)
 }
