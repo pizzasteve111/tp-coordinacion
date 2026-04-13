@@ -53,7 +53,11 @@ Join va a mantener un seguimiento de todas las tareas que procesen los Aggs hast
 
 Para uno de cada uno se reciben los resultados esperados.
 
+cd /mnt/c/Users/juanc/tp-coordinacion/golang
+
 ## Test 2:
+
+Cada client tiene un message handler con el que traduce la info de sus mensajes al protocolo interno del sistema.
 
 Falla porque al no ser distribuido, todos los mensajes de los clientes se los juntan
 y se devuelve el resultado como si fuera uno solo.
@@ -67,3 +71,13 @@ En este caso me piden pasar todos los tests con una replica de cada elemento.
 Lo que priorizamos entonces es la persistencia en disco y dividir el procesamiento de acuerdo al client.
 
 Tanto el mensaje como EoF de message handler tiene que tener el id de client.
+
+
+ ahora sum tiene que mantener un seguimiento de tasks por cada client.
+ Para no tener cargado en memoria muchos mensajes, lo ideal es que cree un json donde persiste los fruit records para cada client. Hay un directorio de storage para cada sum y un archivo de cada client de cada sum, así evitamos leer información extra a la hora de tener que escribir un archivo.
+ cada sum tiene su SumStorage.json donde para cada client tiene sus fruits.
+ Cuando recibe el eof de un client, lee esa parte del archivo y lo procesa, luego limpia cuando ya no necesita nada mas del client.
+ Sum tiene una exchange queue por la que lee, si recibe un EoF, tiene que publicar por esa exchange así todas las demas sum
+se enteran que tal client dejara de mandar mensajes.
+
+Con este enfoque, evitamos tener muchos datos en memoria, persistimos todo lo que podemos en disco, pero evitamos tener que hacer lecturas muy demandantes a la hora de escribir.

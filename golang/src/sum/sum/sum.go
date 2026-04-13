@@ -1,8 +1,11 @@
 package sum
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"sync"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -20,8 +23,51 @@ type SumConfig struct {
 	AggregationPrefix string
 }
 
+//logica de storage de sum. Un directorio por sum con N storages por client y sum.
+
+type sumStorage struct {
+	mu      sync.Mutex
+	dirPath string
+}
+
+func newSumStorage(id int) *sumStorage {
+	dirPath := fmt.Sprintf("/tmp/sum_%d", id)
+	os.MkdirAll(dirPath, 0755)
+	return &sumStorage{dirPath: dirPath}
+}
+
+func (s *sumStorage) filePath(clientId string) string {
+	return fmt.Sprintf("%s/%s.json", s.dirPath, clientId)
+}
+
+func (s *sumStorage) readSumClient(clientId string) ([]fruititem.FruitItem, error) {
+	result := []fruititem.FruitItem{}
+	data, err := os.ReadFile(s.filePath(clientId))
+	if os.IsNotExist(err) {
+		return result, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *sumStorage) writeSumClient(clientId string, items []fruititem.FruitItem) error {
+	bytes, err := json.Marshal(items)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.filePath(clientId), bytes, 0644)
+}
+
 type Sum struct {
-	inputQueue     middleware.Middleware
+	//esto para cuando escalemos a varios sums
+	id         string
+	inputQueue middleware.Middleware
+	//por este exchange los sums reciben EoF de client x
 	outputExchange middleware.Middleware
 	fruitItemMap   map[string]fruititem.FruitItem
 }
