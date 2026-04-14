@@ -132,6 +132,8 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 		inputExchange: inputExchange,
 		fruitItemMap:  map[string]fruititem.FruitItem{},
 		topSize:       config.TopSize,
+		storage:       newAggStorage(config.Id),
+		timers:        map[string]*time.Timer{},
 	}, nil
 }
 
