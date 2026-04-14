@@ -1,14 +1,94 @@
 package aggregation
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
+	"sync"
+	"time"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
 )
+
+const (
+	aggFlushTimeout = 10 * time.Second
+	aggMaxFileSize  = 10 * 1024 * 1024
+)
+
+// el resultado que recibo de sum, las ocurrencias de X frutas y las N tasks originales que corresponde a ese resultado.
+type aggBatch struct {
+	Tasks  int                   `json:"tasks"`
+	Fruits []fruititem.FruitItem `json:"fruits"`
+}
+
+type aggStorage struct {
+	mu      sync.Mutex
+	dirPath string
+}
+
+func newAggStorage(id int) *aggStorage {
+	dirPath := fmt.Sprintf("/tmp/agg_%d", id)
+	os.MkdirAll(dirPath, 0755)
+	return &aggStorage{dirPath: dirPath}
+}
+
+func (s *aggStorage) filePath(clientId string) string {
+	return fmt.Sprintf("%s/%s.json", s.dirPath, clientId)
+}
+
+func (s *aggStorage) AppendBatch(clientId string, batch aggBatch) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	existing := []aggBatch{}
+	data, err := os.ReadFile(s.filePath(clientId))
+	if err != nil && !os.IsNotExist(err) {
+		return 0, err
+	}
+	if len(data) > 0 {
+		json.Unmarshal(data, &existing)
+	}
+	existing = append(existing, batch)
+	bytes, err := json.Marshal(existing)
+	if err != nil {
+		return 0, err
+	}
+	if err := os.WriteFile(s.filePath(clientId), bytes, 0644); err != nil {
+		return 0, err
+	}
+	info, _ := os.Stat(s.filePath(clientId))
+	return info.Size(), nil
+}
+
+func (s *aggStorage) FlushAndClear(clientId string, fn func(aggBatch) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, err := os.Open(s.filePath(clientId))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	dec := json.NewDecoder(f)
+	dec.Token() // consume '['
+	for dec.More() {
+		var batch aggBatch
+		if err := dec.Decode(&batch); err != nil {
+			f.Close()
+			return err
+		}
+		if err := fn(batch); err != nil {
+			f.Close()
+			return err
+		}
+	}
+	f.Close()
+	return os.Remove(s.filePath(clientId))
+}
 
 type AggregationConfig struct {
 	Id                int
@@ -27,6 +107,9 @@ type Aggregation struct {
 	inputExchange middleware.Middleware
 	fruitItemMap  map[string]fruititem.FruitItem
 	topSize       int
+	storage       *aggStorage
+	timers        map[string]*time.Timer
+	timersMu      sync.Mutex
 }
 
 func NewAggregation(config AggregationConfig) (*Aggregation, error) {
@@ -58,60 +141,80 @@ func (aggregation *Aggregation) Run() {
 	})
 }
 
-func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func(), nack func()) {
+func (agg *Aggregation) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	defer ack()
 
-	fruitRecords, isEof, err := inner.DeserializeMessage(&msg)
+	fruits, clientId, totalTasks, isEof, err := inner.DeserializeMessage(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
 		return
 	}
 
 	if isEof {
-		if err := aggregation.handleEndOfRecordsMessage(); err != nil {
-			slog.Error("While handling end of record message", "err", err)
-		}
+		agg.cancelTimer(clientId)
+		agg.flushClient(clientId)
+		agg.sendEof(clientId, totalTasks) // reenvía EOF a Join con totalTasks del gateway
 		return
 	}
 
-	aggregation.handleDataMessage(fruitRecords)
+	fileSize, err := agg.storage.AppendBatch(clientId, aggBatch{
+		Tasks:  totalTasks,
+		Fruits: fruits,
+	})
+	if err != nil {
+		slog.Error("While appending batch", "err", err)
+		return
+	}
+
+	if fileSize >= aggMaxFileSize {
+		agg.cancelTimer(clientId)
+		agg.flushClient(clientId)
+	} else {
+		agg.resetTimer(clientId)
+	}
 }
 
-func (aggregation *Aggregation) handleEndOfRecordsMessage() error {
-	slog.Info("Received End Of Records message")
+func (agg *Aggregation) flushClient(clientId string) {
+	aggregated := map[string]fruititem.FruitItem{}
+	accumulatedTasks := 0
 
-	fruitTopRecords := aggregation.buildFruitTop()
-	message, err := inner.SerializeMessage(fruitTopRecords)
-	if err != nil {
-		slog.Debug("While serializing top message", "err", err)
-		return err
-	}
-	if err := aggregation.outputQueue.Send(*message); err != nil {
-		slog.Debug("While sending top message", "err", err)
-		return err
-	}
-
-	eofMessage := []fruititem.FruitItem{}
-	message, err = inner.SerializeMessage(eofMessage)
-	if err != nil {
-		slog.Debug("While serializing EOF message", "err", err)
-		return err
-	}
-	if err := aggregation.outputQueue.Send(*message); err != nil {
-		slog.Debug("While sending EOF message", "err", err)
-		return err
-	}
-	return nil
-}
-
-func (aggregation *Aggregation) handleDataMessage(fruitRecords []fruititem.FruitItem) {
-	for _, fruitRecord := range fruitRecords {
-		if _, ok := aggregation.fruitItemMap[fruitRecord.Fruit]; ok {
-			aggregation.fruitItemMap[fruitRecord.Fruit] = aggregation.fruitItemMap[fruitRecord.Fruit].Sum(fruitRecord)
-		} else {
-			aggregation.fruitItemMap[fruitRecord.Fruit] = fruitRecord
+	err := agg.storage.FlushAndClear(clientId, func(batch aggBatch) error {
+		accumulatedTasks += batch.Tasks
+		for _, fruit := range batch.Fruits {
+			if existing, ok := aggregated[fruit.Fruit]; ok {
+				aggregated[fruit.Fruit] = existing.Sum(fruit)
+			} else {
+				aggregated[fruit.Fruit] = fruit
+			}
 		}
+		return nil
+	})
+	if err != nil || accumulatedTasks == 0 {
+		return
 	}
+
+	fruits := make([]fruititem.FruitItem, 0, len(aggregated))
+	for _, item := range aggregated {
+		fruits = append(fruits, item)
+	}
+
+	msg, err := inner.SerializeMessage(fruits, clientId, accumulatedTasks)
+	if err != nil {
+		slog.Error("While serializing flush", "err", err)
+		return
+	}
+	if err := agg.outputQueue.Send(*msg); err != nil {
+		slog.Error("While sending flush", "err", err)
+	}
+}
+
+func (agg *Aggregation) sendEof(clientId string, totalTasks int) {
+	msg, err := inner.SerializeMessage([]fruititem.FruitItem{}, clientId, totalTasks)
+	if err != nil {
+		slog.Error("While serializing EOF", "err", err)
+		return
+	}
+	agg.outputQueue.Send(*msg)
 }
 
 func (aggregation *Aggregation) buildFruitTop() []fruititem.FruitItem {
@@ -124,4 +227,25 @@ func (aggregation *Aggregation) buildFruitTop() []fruititem.FruitItem {
 	})
 	finalTopSize := min(aggregation.topSize, len(fruitItems))
 	return fruitItems[:finalTopSize]
+}
+
+func (agg *Aggregation) resetTimer(clientId string) {
+	agg.timersMu.Lock()
+	defer agg.timersMu.Unlock()
+	if t, ok := agg.timers[clientId]; ok {
+		t.Stop()
+	}
+	agg.timers[clientId] = time.AfterFunc(aggFlushTimeout, func() {
+		agg.cancelTimer(clientId)
+		agg.flushClient(clientId)
+	})
+}
+
+func (agg *Aggregation) cancelTimer(clientId string) {
+	agg.timersMu.Lock()
+	defer agg.timersMu.Unlock()
+	if t, ok := agg.timers[clientId]; ok {
+		t.Stop()
+		delete(agg.timers, clientId)
+	}
 }
