@@ -195,12 +195,9 @@ func (agg *Aggregation) flushClient(clientId string) {
 		return
 	}
 
-	fruits := make([]fruititem.FruitItem, 0, len(aggregated))
-	for _, item := range aggregated {
-		fruits = append(fruits, item)
-	}
+	top := agg.buildFruitTop(aggregated)
 
-	msg, err := inner.SerializeMessage(fruits, clientId, accumulatedTasks)
+	msg, err := inner.SerializeMessage(top, clientId, accumulatedTasks)
 	if err != nil {
 		slog.Error("While serializing flush", "err", err)
 		return
@@ -219,15 +216,15 @@ func (agg *Aggregation) sendEof(clientId string, totalTasks int) {
 	agg.outputQueue.Send(*msg)
 }
 
-func (aggregation *Aggregation) buildFruitTop() []fruititem.FruitItem {
-	fruitItems := make([]fruititem.FruitItem, 0, len(aggregation.fruitItemMap))
-	for _, item := range aggregation.fruitItemMap {
+func (agg *Aggregation) buildFruitTop(aggregated map[string]fruititem.FruitItem) []fruititem.FruitItem {
+	fruitItems := make([]fruititem.FruitItem, 0, len(aggregated))
+	for _, item := range aggregated {
 		fruitItems = append(fruitItems, item)
 	}
 	sort.SliceStable(fruitItems, func(i, j int) bool {
 		return fruitItems[j].Less(fruitItems[i])
 	})
-	finalTopSize := min(aggregation.topSize, len(fruitItems))
+	finalTopSize := min(agg.topSize, len(fruitItems))
 	return fruitItems[:finalTopSize]
 }
 
