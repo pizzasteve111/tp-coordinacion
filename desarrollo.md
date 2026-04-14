@@ -86,4 +86,6 @@ va a saber si ya termino de recibir frutas para un cliente en particular.
 Con este enfoque, evitamos tener muchos datos en memoria, persistimos todo lo que podemos en disco, pero evitamos tener que hacer lecturas muy demandantes a la hora de escribir.
 
 
-En aggrgation repetimos la misma lógica de storage, en un refactor voy a intentar de que no se duplique el codigo y sea el mismo struct para ambos
+En aggrgation repetimos la misma lógica de storage, en un refactor voy a intentar de que no se duplique el codigo y sea el mismo struct para ambos.
+
+Join reúne resultados parciales y genera el mejor top por cada 
