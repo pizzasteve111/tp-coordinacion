@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -22,6 +23,11 @@ type SumConfig struct {
 	AggregationAmount int
 	AggregationPrefix string
 }
+
+const (
+	flushTimeout = 10 * time.Second
+	maxFileSize  = 10 * 1024 * 1024
+)
 
 //logica de storage de sum. Un directorio por sum con N storages por client y sum.
 
@@ -63,13 +69,103 @@ func (s *sumStorage) writeSumClient(clientId string, items []fruititem.FruitItem
 	return os.WriteFile(s.filePath(clientId), bytes, 0644)
 }
 
+// devuelve el tamaño del archivo así sabemos si hay que mandar a flushear
+func (s *sumStorage) Append(clientId string, items []fruititem.FruitItem) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	existing, err := s.readSumClient(clientId)
+	if err != nil {
+		return 0, err
+	}
+	if err := s.writeSumClient(clientId, append(existing, items...)); err != nil {
+		return 0, err
+	}
+	info, err := os.Stat(s.filePath(clientId))
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
+// quiero iterar el storage de un client sin tener que levantar todo en memoria, itero y descarto.
+func (s *sumStorage) ForEach(clientId string, fn func(fruititem.FruitItem) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f, err := os.Open(s.filePath(clientId))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	dec := json.NewDecoder(f)
+
+	if _, err := dec.Token(); err != nil { // consume el '['
+		return err
+	}
+	for dec.More() {
+		var item fruititem.FruitItem
+		if err := dec.Decode(&item); err != nil {
+			return err
+		}
+		if err := fn(item); err != nil {
+			return err
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return err
+	}
+	return nil
+}
+func (s *sumStorage) Delete(clientId string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return os.Remove(s.filePath(clientId))
+}
+
+// función para limpiar archivos
+func (s *sumStorage) FlushAndClear(clientId string, fn func(fruititem.FruitItem) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, err := os.Open(s.filePath(clientId))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	dec := json.NewDecoder(f)
+	if _, err := dec.Token(); err != nil { // consume '['
+		f.Close()
+		return err
+	}
+	for dec.More() {
+		var item fruititem.FruitItem
+		if err := dec.Decode(&item); err != nil {
+			f.Close()
+			return err
+		}
+		if err := fn(item); err != nil {
+			f.Close()
+			return err
+		}
+	}
+	f.Close()
+	return os.Remove(s.filePath(clientId))
+}
+
 type Sum struct {
 	//esto para cuando escalemos a varios sums
-	id         string
 	inputQueue middleware.Middleware
 	//por este exchange los sums reciben EoF de client x
 	outputExchange middleware.Middleware
 	fruitItemMap   map[string]fruititem.FruitItem
+	storage        *sumStorage
+	timers         map[string]*time.Timer
+	timersMu       sync.Mutex
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -95,10 +191,13 @@ func NewSum(config SumConfig) (*Sum, error) {
 		inputQueue:     inputQueue,
 		outputExchange: outputExchange,
 		fruitItemMap:   map[string]fruititem.FruitItem{},
+		storage:        newSumStorage(config.Id),
+		timers:         map[string]*time.Timer{},
 	}, nil
 }
 
 func (sum *Sum) Run() {
+	//habría que poner a consumir la output queue tambien
 	sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		sum.handleMessage(msg, ack, nack)
 	})
@@ -107,29 +206,118 @@ func (sum *Sum) Run() {
 func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	defer ack()
 
-	fruitRecords, isEof, err := inner.DeserializeMessage(&msg)
+	fruitRecords, clientId, totalTasks, isEof, err := inner.DeserializeMessage(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
 		return
 	}
 
 	if isEof {
-		if err := sum.handleEndOfRecordMessage(); err != nil {
-			slog.Error("While handling end of record message", "err", err)
-		}
+		sum.cancelTimer(clientId)
+		sum.flushClient(clientId)         // flush lo que quedó
+		sum.sendEof(clientId, totalTasks) // propaga EOF con total del gateway
 		return
 	}
+	fileSize, err := sum.storage.Append(clientId, fruitRecords)
+	if err != nil {
+		slog.Error("While appending to storage", "err", err)
+		return
+	}
+	//tiene que verificar si no se paso el timeout
+	if fileSize >= maxFileSize {
+		sum.cancelTimer(clientId)
+		sum.flushClient(clientId)
+	} else {
+		sum.resetTimer(clientId)
+	}
 
-	if err := sum.handleDataMessage(fruitRecords); err != nil {
-		slog.Error("While handling data message", "err", err)
+}
+
+func (sum *Sum) flushClient(clientId string) {
+	aggregated := map[string]fruititem.FruitItem{}
+	count := 0
+
+	err := sum.storage.FlushAndClear(clientId, func(item fruititem.FruitItem) error {
+		count++
+		if existing, ok := aggregated[item.Fruit]; ok {
+			aggregated[item.Fruit] = existing.Sum(item)
+		} else {
+			aggregated[item.Fruit] = item
+		}
+		return nil
+	})
+	if err != nil {
+		slog.Error("While flushing client", "clientId", clientId, "err", err)
+		return
+	}
+	if count == 0 {
+		return // archivo vacío, nada que enviar
+	}
+
+	for _, item := range aggregated {
+		msg, err := inner.SerializeMessage([]fruititem.FruitItem{item}, clientId, count)
+		if err != nil {
+			slog.Error("While serializing flush message", "err", err)
+			return
+		}
+		if err := sum.outputExchange.Send(*msg); err != nil {
+			slog.Error("While sending flush message", "err", err)
+			return
+		}
 	}
 }
 
-func (sum *Sum) handleEndOfRecordMessage() error {
-	slog.Info("Received End Of Records message")
-	for key := range sum.fruitItemMap {
-		fruitRecord := []fruititem.FruitItem{sum.fruitItemMap[key]}
-		message, err := inner.SerializeMessage(fruitRecord)
+func (sum *Sum) sendEof(clientId string, totalTasks int) {
+	msg, err := inner.SerializeMessage([]fruititem.FruitItem{}, clientId, totalTasks)
+	if err != nil {
+		slog.Error("While serializing EOF", "err", err)
+		return
+	}
+	if err := sum.outputExchange.Send(*msg); err != nil {
+		slog.Error("While sending EOF", "err", err)
+	}
+}
+
+func (sum *Sum) resetTimer(clientId string) {
+	sum.timersMu.Lock()
+	defer sum.timersMu.Unlock()
+	if t, ok := sum.timers[clientId]; ok {
+		t.Stop()
+	}
+	//despues del timeout, llamo a flushear
+	sum.timers[clientId] = time.AfterFunc(flushTimeout, func() {
+		sum.cancelTimer(clientId)
+		sum.flushClient(clientId)
+	})
+}
+
+func (sum *Sum) cancelTimer(clientId string) {
+	sum.timersMu.Lock()
+	defer sum.timersMu.Unlock()
+	if t, ok := sum.timers[clientId]; ok {
+		t.Stop()
+		delete(sum.timers, clientId)
+	}
+}
+
+func (sum *Sum) handleEndOfRecordMessage(clientId string, totalTasks int) error {
+	slog.Info("Received End Of Records message", "clientId", clientId)
+
+	aggregated := map[string]fruititem.FruitItem{}
+	err := sum.storage.ForEach(clientId, func(item fruititem.FruitItem) error {
+		if existing, ok := aggregated[item.Fruit]; ok {
+			aggregated[item.Fruit] = existing.Sum(item)
+		} else {
+			aggregated[item.Fruit] = item
+		}
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+	for _, item := range aggregated {
+		message, err := inner.SerializeMessage([]fruititem.FruitItem{item}, clientId, 0)
 		if err != nil {
 			slog.Debug("While serializing message", "err", err)
 			return err
@@ -140,17 +328,17 @@ func (sum *Sum) handleEndOfRecordMessage() error {
 		}
 	}
 
-	eofMessage := []fruititem.FruitItem{}
-	message, err := inner.SerializeMessage(eofMessage)
+	eofMessage, err := inner.SerializeMessage([]fruititem.FruitItem{}, clientId, totalTasks)
 	if err != nil {
 		slog.Debug("While serializing EOF message", "err", err)
 		return err
 	}
-	if err := sum.outputExchange.Send(*message); err != nil {
+	if err := sum.outputExchange.Send(*eofMessage); err != nil {
 		slog.Debug("While sending EOF message", "err", err)
 		return err
 	}
-	return nil
+	//cambiarlo por flush sino
+	return sum.storage.Delete(clientId)
 }
 
 func (sum *Sum) handleDataMessage(fruitRecords []fruititem.FruitItem) error {

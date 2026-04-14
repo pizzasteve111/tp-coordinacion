@@ -43,8 +43,8 @@ payload, X tareas completadas de N totales
 Entonces un aggregator sabe cuantas tareas ya procesó de las N que le pueden llegar.
 
 
-Un aggregator va recibiendo mensajes de Sums y va sumando cuantas tareas procesa de las N originales.
-Persisten sus datos en disco y cuando pasa X tiempo sin recibir mensajes, hacen un procesamiento y lo mandan a Join.
+Los aggregators reciben mensajes de Sum, los persisten por client id, si esta persistencia alcanza un tamaño N
+o pasa un tiempo T, lo procesa generando un resultado parcial y limpia ese archivo, le pasa a Join el resultado parcial y le dice que eso le corresponde a X de las N tasks originales de gateway. Cuando join recibe todos los resultados parciales y ve que eso ya completa todas las tasks de un client, les dice a todos los aggregators que pueden borrar el archivo de clientX, esto es solo la conveniencia de borrar un archivo vacío.
 Terminan de esperar mensajes y mandan sus resultados a Join indicando "procese X tareas de las 150" en total.
 
 Join va a mantener un seguimiento de todas las tareas que procesen los Aggs hasta que se llegue al máximo.
@@ -76,8 +76,12 @@ Tanto el mensaje como EoF de message handler tiene que tener el id de client.
  ahora sum tiene que mantener un seguimiento de tasks por cada client.
  Para no tener cargado en memoria muchos mensajes, lo ideal es que cree un json donde persiste los fruit records para cada client. Hay un directorio de storage para cada sum y un archivo de cada client de cada sum, así evitamos leer información extra a la hora de tener que escribir un archivo.
  cada sum tiene su SumStorage.json donde para cada client tiene sus fruits.
- Cuando recibe el eof de un client, lee esa parte del archivo y lo procesa, luego limpia cuando ya no necesita nada mas del client.
- Sum tiene una exchange queue por la que lee, si recibe un EoF, tiene que publicar por esa exchange así todas las demas sum
-se enteran que tal client dejara de mandar mensajes.
+Cuando un storage de client pasa de 10mb o se cumple un timeout, ese sum procesa el archivo y manda el resultado
+flusheando el archivo y dejandolo limpio. Sum entonces podría hacer varios procesamientos por cada client, pero nos ahorramos tener que sincronizar todas las instancias. Si queremos evitar tanto procesamiento, basta con aumentar el tamaño permitido o timeout.
+Si recibe EoF del gateway, simplemente se lo manda a Aggregator para que le llegue a join.
+Cuando genera un resultado comunica al aggregator cuantas frutas proceso de ese cliente.
+Así Join va a conocer las frutas totales por cliente y, a medida que le lleguen los resultados de aggregator,
+va a saber si ya termino de recibir frutas para un cliente en particular.
 
 Con este enfoque, evitamos tener muchos datos en memoria, persistimos todo lo que podemos en disco, pero evitamos tener que hacer lecturas muy demandantes a la hora de escribir.
+.
