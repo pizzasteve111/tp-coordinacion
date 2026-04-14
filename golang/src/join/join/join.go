@@ -91,8 +91,6 @@ type Join struct {
 	inputQueue  middleware.Middleware
 	outputQueue middleware.Middleware
 	storage     *joinStorage
-	tasksMu     sync.Mutex
-	accTasks    map[string]int
 	topAmount   int
 }
 
@@ -110,7 +108,7 @@ func NewJoin(config JoinConfig) (*Join, error) {
 		return nil, err
 	}
 
-	return &Join{inputQueue: inputQueue, outputQueue: outputQueue, storage: newJoinStorage(), accTasks: map[string]int{}, topAmount: config.TopSize}, nil
+	return &Join{inputQueue: inputQueue, outputQueue: outputQueue, storage: newJoinStorage(), topAmount: config.TopSize}, nil
 }
 
 func (join *Join) Run() {
@@ -141,24 +139,9 @@ func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func())
 		slog.Error("While appending batch", "clientId", clientId, "err", err)
 		return
 	}
-
-	join.tasksMu.Lock()
-	join.accTasks[clientId] += totalTasks
-	join.tasksMu.Unlock()
 }
 
 func (join *Join) handleEof(clientId string, totalTasks int) {
-	join.tasksMu.Lock()
-	acc := join.accTasks[clientId]
-	join.tasksMu.Unlock()
-
-	if acc != totalTasks {
-		slog.Warn("Task count mismatch on EOF",
-			"clientId", clientId,
-			"accumulated", acc,
-			"expected", totalTasks,
-		)
-	}
 
 	// Generar top global a partir de todos los tops parciales
 	aggregated := map[string]fruititem.FruitItem{}
@@ -199,10 +182,6 @@ func (join *Join) handleEof(clientId string, totalTasks int) {
 		slog.Error("While sending top", "err", err)
 		return
 	}
-
-	join.tasksMu.Lock()
-	delete(join.accTasks, clientId)
-	join.tasksMu.Unlock()
 
 	slog.Info("Top sent to gateway", "clientId", clientId, "top", fruits)
 }
