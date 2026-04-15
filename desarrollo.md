@@ -98,3 +98,7 @@ Ahora el envío de mensajes no es siempre FiFo ya que hay timeouts en el flusheo
 le llegue el EoF de un client pero que todavía no se termine de llegar todo el flujo original.
 
 En Join agregamos un contador de tasksReceived que join compara y cuando iguala el valor dado por el EoF, ahí genera el resultado final. De esta forma Join hace un procesamiento por cliente una sola vez.
+
+Cambio en el formato de mensaje: Ahora luego de flushear un archivo, se manda por cada fruta el total de sus apariciones, la cantidad de mensajes que se procesaron para contar esa fruta y el cliente al que le pertence.
+
+De esta forma evitas mandar todo el procesamiento en un solo mensaje, algo que puede ser muy pesado.

@@ -254,8 +254,12 @@ func (sum *Sum) flushClient(clientId string) {
 		return // archivo vacío, nada que enviar
 	}
 
+	items := make([]fruititem.FruitItem, 0, len(aggregated))
 	for _, item := range aggregated {
-		msg, err := inner.SerializeMessage([]fruititem.FruitItem{item}, clientId, count)
+		//error: mandaba el total tasks por cada fruit item, como si cada uno valiese por ese total.
+		//mando todas las frutas procesadas en un mensaje
+		items = append(items, item)
+		msg, err := inner.SerializeMessage(items, clientId, count)
 		if err != nil {
 			slog.Error("While serializing flush message", "err", err)
 			return
@@ -298,57 +302,4 @@ func (sum *Sum) cancelTimer(clientId string) {
 		t.Stop()
 		delete(sum.timers, clientId)
 	}
-}
-
-func (sum *Sum) handleEndOfRecordMessage(clientId string, totalTasks int) error {
-	slog.Info("Received End Of Records message", "clientId", clientId)
-
-	aggregated := map[string]fruititem.FruitItem{}
-	err := sum.storage.ForEach(clientId, func(item fruititem.FruitItem) error {
-		if existing, ok := aggregated[item.Fruit]; ok {
-			aggregated[item.Fruit] = existing.Sum(item)
-		} else {
-			aggregated[item.Fruit] = item
-		}
-		return nil
-	})
-
-	if err != nil {
-		return err
-	}
-	for _, item := range aggregated {
-		message, err := inner.SerializeMessage([]fruititem.FruitItem{item}, clientId, 0)
-		if err != nil {
-			slog.Debug("While serializing message", "err", err)
-			return err
-		}
-		if err := sum.outputExchange.Send(*message); err != nil {
-			slog.Debug("While sending message", "err", err)
-			return err
-		}
-	}
-
-	eofMessage, err := inner.SerializeMessage([]fruititem.FruitItem{}, clientId, totalTasks)
-	if err != nil {
-		slog.Debug("While serializing EOF message", "err", err)
-		return err
-	}
-	if err := sum.outputExchange.Send(*eofMessage); err != nil {
-		slog.Debug("While sending EOF message", "err", err)
-		return err
-	}
-	//cambiarlo por flush sino
-	return sum.storage.Delete(clientId)
-}
-
-func (sum *Sum) handleDataMessage(fruitRecords []fruititem.FruitItem) error {
-	for _, fruitRecord := range fruitRecords {
-		_, ok := sum.fruitItemMap[fruitRecord.Fruit]
-		if ok {
-			sum.fruitItemMap[fruitRecord.Fruit] = sum.fruitItemMap[fruitRecord.Fruit].Sum(fruitRecord)
-		} else {
-			sum.fruitItemMap[fruitRecord.Fruit] = fruitRecord
-		}
-	}
-	return nil
 }
