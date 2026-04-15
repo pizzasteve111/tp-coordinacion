@@ -254,12 +254,11 @@ func (sum *Sum) flushClient(clientId string) {
 		return // archivo vacío, nada que enviar
 	}
 
-	items := make([]fruititem.FruitItem, 0, len(aggregated))
 	for _, item := range aggregated {
 		//error: mandaba el total tasks por cada fruit item, como si cada uno valiese por ese total.
 		//mando todas las frutas procesadas en un mensaje
-		items = append(items, item)
-		msg, err := inner.SerializeMessage(items, clientId, fruitCounts[item.Fruit])
+
+		msg, err := inner.SerializeMessage([]fruititem.FruitItem{item}, clientId, fruitCounts[item.Fruit])
 		if err != nil {
 			slog.Error("While serializing flush message", "err", err)
 			return
