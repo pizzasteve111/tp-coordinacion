@@ -16,7 +16,6 @@ import (
 
 const (
 	aggFlushTimeout = 10 * time.Second
-	aggMaxFileSize  = 10 * 1024 * 1024
 )
 
 // el resultado que recibo de sum, las ocurrencias de X frutas y las N tasks originales que corresponde a ese resultado.
@@ -40,13 +39,13 @@ func (s *aggStorage) filePath(clientId string) string {
 	return fmt.Sprintf("%s/%s.json", s.dirPath, clientId)
 }
 
-func (s *aggStorage) AppendBatch(clientId string, batch aggBatch) (int64, error) {
+func (s *aggStorage) AppendBatch(clientId string, batch aggBatch) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	existing := []aggBatch{}
 	data, err := os.ReadFile(s.filePath(clientId))
 	if err != nil && !os.IsNotExist(err) {
-		return 0, err
+		return err
 	}
 	if len(data) > 0 {
 		json.Unmarshal(data, &existing)
@@ -54,13 +53,10 @@ func (s *aggStorage) AppendBatch(clientId string, batch aggBatch) (int64, error)
 	existing = append(existing, batch)
 	bytes, err := json.Marshal(existing)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	if err := os.WriteFile(s.filePath(clientId), bytes, 0644); err != nil {
-		return 0, err
-	}
-	info, _ := os.Stat(s.filePath(clientId))
-	return info.Size(), nil
+	return os.WriteFile(s.filePath(clientId), bytes, 0644)
+
 }
 
 func (s *aggStorage) FlushAndClear(clientId string, fn func(aggBatch) error) error {
@@ -103,13 +99,13 @@ type AggregationConfig struct {
 }
 
 type Aggregation struct {
-	outputQueue   middleware.Middleware
-	inputExchange middleware.Middleware
-	fruitItemMap  map[string]fruititem.FruitItem
-	topSize       int
-	storage       *aggStorage
-	timers        map[string]*time.Timer
-	timersMu      sync.Mutex
+	outputQueue     middleware.Middleware
+	inputExchange   middleware.Middleware
+	topSize         int
+	storage         *aggStorage
+	timers          map[string]*time.Timer
+	timersMu        sync.Mutex
+	pendingEofTasks map[string]int
 }
 
 func NewAggregation(config AggregationConfig) (*Aggregation, error) {
@@ -128,12 +124,12 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 	}
 
 	return &Aggregation{
-		outputQueue:   outputQueue,
-		inputExchange: inputExchange,
-		fruitItemMap:  map[string]fruititem.FruitItem{},
-		topSize:       config.TopSize,
-		storage:       newAggStorage(config.Id),
-		timers:        map[string]*time.Timer{},
+		outputQueue:     outputQueue,
+		inputExchange:   inputExchange,
+		topSize:         config.TopSize,
+		storage:         newAggStorage(config.Id),
+		timers:          map[string]*time.Timer{},
+		pendingEofTasks: map[string]int{},
 	}, nil
 }
 
@@ -153,27 +149,24 @@ func (agg *Aggregation) handleMessage(msg middleware.Message, ack func(), nack f
 	}
 
 	if isEof {
-		agg.cancelTimer(clientId)
-		agg.flushClient(clientId)
+		agg.timersMu.Lock()
+		agg.pendingEofTasks[clientId] = totalTasks
+		agg.timersMu.Unlock()
+		agg.resetTimer(clientId)
 		agg.sendEof(clientId, totalTasks) // reenvía EOF a Join con totalTasks del gateway
 		return
 	}
 
-	fileSize, err := agg.storage.AppendBatch(clientId, aggBatch{
+	if err := agg.storage.AppendBatch(clientId, aggBatch{
 		Tasks:  totalTasks,
 		Fruits: fruits,
-	})
-	if err != nil {
+	}); err != nil {
 		slog.Error("While appending batch", "err", err)
 		return
 	}
 
-	if fileSize >= aggMaxFileSize {
-		agg.cancelTimer(clientId)
-		agg.flushClient(clientId)
-	} else {
-		agg.resetTimer(clientId)
-	}
+	agg.resetTimer(clientId)
+
 }
 
 func (agg *Aggregation) flushClient(clientId string) {
@@ -194,7 +187,7 @@ func (agg *Aggregation) flushClient(clientId string) {
 	if err != nil || accumulatedTasks == 0 {
 		return
 	}
-
+	//no debe descartar todas las ocurrencias de frutas que no llegan al top
 	top := agg.buildFruitTop(aggregated)
 
 	msg, err := inner.SerializeMessage(top, clientId, accumulatedTasks)
@@ -235,7 +228,19 @@ func (agg *Aggregation) resetTimer(clientId string) {
 		t.Stop()
 	}
 	agg.timers[clientId] = time.AfterFunc(aggFlushTimeout, func() {
-		agg.cancelTimer(clientId)
+		//logica luego de los 10s del ultimo mensaje de un client
+		agg.timersMu.Lock()
+		_, hasPending := agg.pendingEofTasks[clientId]
+		if hasPending {
+			delete(agg.pendingEofTasks, clientId)
+		}
+		delete(agg.timers, clientId)
+		agg.timersMu.Unlock()
+
+		if !hasPending {
+			// Llegaron datos pero todavía no se recibió EOF: no flushear aún
+			return
+		}
 		agg.flushClient(clientId)
 	})
 }

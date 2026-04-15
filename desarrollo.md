@@ -101,4 +101,7 @@ En Join agregamos un contador de tasksReceived que join compara y cuando iguala 
 
 Cambio en el formato de mensaje: Ahora luego de flushear un archivo, se manda por cada fruta el total de sus apariciones, la cantidad de mensajes que se procesaron para contar esa fruta y el cliente al que le pertence.
 
-De esta forma evitas mandar todo el procesamiento en un solo mensaje, algo que puede ser muy pesado.
+De esta forma evitas mandar todo el procesamiento en un solo mensaje, algo que puede ser muy pesado si en un futuro amplias el tamaño de client en disco. Lo que sí, se genera mas trafico al mandar una fruta de cada client.
+
+
+Que el routing de exchange sea por id de client, así todos los datos de un client van a la misma instancia de un aggregation, que tambien recibe el EoF
