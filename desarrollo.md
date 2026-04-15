@@ -88,4 +88,13 @@ Con este enfoque, evitamos tener muchos datos en memoria, persistimos todo lo qu
 
 En aggrgation repetimos la misma lógica de storage, en un refactor voy a intentar de que no se duplique el codigo y sea el mismo struct para ambos.
 
-Join reúne resultados parciales y genera el mejor top por cada 
+Join reúne resultados parciales y genera el mejor top por cada.
+
+## Test 3:
+
+Ahora se levantan varias instancias de sum, la implementación no debería de cambiar mucho.
+
+Ahora el envío de mensajes no es siempre FiFo ya que hay timeouts en el flusheo de archivos, puede que a Join
+le llegue el EoF de un client pero que todavía no se termine de llegar todo el flujo original.
+
+En Join agregamos un contador de tasksReceived que join compara y cuando iguala el valor dado por el EoF, ahí genera el resultado final. De esta forma Join hace un procesamiento por cliente una sola vez.

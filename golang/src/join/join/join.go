@@ -87,10 +87,14 @@ func (s *joinStorage) FlushAndClear(clientId string, fn func(joinBatch) error) e
 	return os.Remove(s.filePath(clientId))
 }
 
+// me guardo las tasks que me van llegando y el total tasks cuando recibo EoF.
 type Join struct {
 	inputQueue  middleware.Middleware
 	outputQueue middleware.Middleware
 	storage     *joinStorage
+	tasksMu     sync.Mutex
+	accTasks    map[string]int
+	pendingEof  map[string]int
 	topAmount   int
 }
 
@@ -108,7 +112,7 @@ func NewJoin(config JoinConfig) (*Join, error) {
 		return nil, err
 	}
 
-	return &Join{inputQueue: inputQueue, outputQueue: outputQueue, storage: newJoinStorage(), topAmount: config.TopSize}, nil
+	return &Join{inputQueue: inputQueue, outputQueue: outputQueue, storage: newJoinStorage(), topAmount: config.TopSize, accTasks: map[string]int{}, pendingEof: map[string]int{}}, nil
 }
 
 func (join *Join) Run() {
@@ -139,9 +143,38 @@ func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func())
 		slog.Error("While appending batch", "clientId", clientId, "err", err)
 		return
 	}
-}
 
+	join.tasksMu.Lock()
+	join.accTasks[clientId] += totalTasks
+	acc := join.accTasks[clientId]
+	expected, hasPending := join.pendingEof[clientId]
+	join.tasksMu.Unlock()
+	//si ya recibí todo, genero resultado global
+	if hasPending && acc >= expected {
+		join.processResult(clientId, expected)
+	}
+}
 func (join *Join) handleEof(clientId string, totalTasks int) {
+	join.tasksMu.Lock()
+	acc := join.accTasks[clientId]
+	join.tasksMu.Unlock()
+
+	if acc >= totalTasks {
+		join.processResult(clientId, totalTasks)
+	} else {
+		join.tasksMu.Lock()
+		join.pendingEof[clientId] = totalTasks
+		join.tasksMu.Unlock()
+		slog.Info("EOF received before all data, waiting",
+			"clientId", clientId, "accumulated", acc, "expected", totalTasks)
+	}
+}
+func (join *Join) processResult(clientId string, totalTasks int) {
+	//me borro de la existencia de ese client
+	join.tasksMu.Lock()
+	delete(join.accTasks, clientId)
+	delete(join.pendingEof, clientId)
+	join.tasksMu.Unlock()
 
 	// Generar top global a partir de todos los tops parciales
 	aggregated := map[string]fruititem.FruitItem{}
