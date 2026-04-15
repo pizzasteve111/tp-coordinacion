@@ -235,10 +235,10 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 
 func (sum *Sum) flushClient(clientId string) {
 	aggregated := map[string]fruititem.FruitItem{}
-	count := 0
+	fruitCounts := map[string]int{}
 
 	err := sum.storage.FlushAndClear(clientId, func(item fruititem.FruitItem) error {
-		count++
+		fruitCounts[item.Fruit]++
 		if existing, ok := aggregated[item.Fruit]; ok {
 			aggregated[item.Fruit] = existing.Sum(item)
 		} else {
@@ -250,7 +250,7 @@ func (sum *Sum) flushClient(clientId string) {
 		slog.Error("While flushing client", "clientId", clientId, "err", err)
 		return
 	}
-	if count == 0 {
+	if len(aggregated) == 0 {
 		return // archivo vacío, nada que enviar
 	}
 
@@ -259,7 +259,7 @@ func (sum *Sum) flushClient(clientId string) {
 		//error: mandaba el total tasks por cada fruit item, como si cada uno valiese por ese total.
 		//mando todas las frutas procesadas en un mensaje
 		items = append(items, item)
-		msg, err := inner.SerializeMessage(items, clientId, count)
+		msg, err := inner.SerializeMessage(items, clientId, fruitCounts[item.Fruit])
 		if err != nil {
 			slog.Error("While serializing flush message", "err", err)
 			return
