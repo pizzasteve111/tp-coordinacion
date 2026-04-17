@@ -3,6 +3,7 @@ package sum
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"os"
 	"sync"
@@ -161,11 +162,13 @@ type Sum struct {
 	//esto para cuando escalemos a varios sums
 	inputQueue middleware.Middleware
 	//por este exchange los sums reciben EoF de client x
-	outputExchange middleware.Middleware
-	fruitItemMap   map[string]fruititem.FruitItem
-	storage        *sumStorage
-	timers         map[string]*time.Timer
-	timersMu       sync.Mutex
+	outputExchange    middleware.Middleware
+	fruitItemMap      map[string]fruititem.FruitItem
+	storage           *sumStorage
+	timers            map[string]*time.Timer
+	timersMu          sync.Mutex
+	aggAmount         int
+	aggregationPrefix string
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -188,11 +191,13 @@ func NewSum(config SumConfig) (*Sum, error) {
 	}
 
 	return &Sum{
-		inputQueue:     inputQueue,
-		outputExchange: outputExchange,
-		fruitItemMap:   map[string]fruititem.FruitItem{},
-		storage:        newSumStorage(config.Id),
-		timers:         map[string]*time.Timer{},
+		inputQueue:        inputQueue,
+		outputExchange:    outputExchange,
+		fruitItemMap:      map[string]fruititem.FruitItem{},
+		storage:           newSumStorage(config.Id),
+		timers:            map[string]*time.Timer{},
+		aggAmount:         config.AggregationAmount,
+		aggregationPrefix: config.AggregationPrefix,
 	}, nil
 }
 
@@ -263,6 +268,7 @@ func (sum *Sum) flushClient(clientId string) {
 			slog.Error("While serializing flush message", "err", err)
 			return
 		}
+		msg.RoutingKey = sum.aggregationKeyFor(clientId)
 		if err := sum.outputExchange.Send(*msg); err != nil {
 			slog.Error("While sending flush message", "err", err)
 			return
@@ -276,6 +282,7 @@ func (sum *Sum) sendEof(clientId string, totalTasks int) {
 		slog.Error("While serializing EOF", "err", err)
 		return
 	}
+	msg.RoutingKey = sum.aggregationKeyFor(clientId)
 	if err := sum.outputExchange.Send(*msg); err != nil {
 		slog.Error("While sending EOF", "err", err)
 	}
@@ -301,4 +308,11 @@ func (sum *Sum) cancelTimer(clientId string) {
 		t.Stop()
 		delete(sum.timers, clientId)
 	}
+}
+
+func (sum *Sum) aggregationKeyFor(clientId string) string {
+	h := fnv.New32a()
+	h.Write([]byte(clientId))
+	idx := h.Sum32() % uint32(sum.aggAmount)
+	return fmt.Sprintf("%s_%d", sum.aggregationPrefix, idx)
 }

@@ -9,7 +9,8 @@ var (
 )
 
 type Message struct {
-	Body string
+	Body       string
+	RoutingKey string
 }
 
 type ConnSettings struct {

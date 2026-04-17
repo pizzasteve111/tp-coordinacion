@@ -74,7 +74,11 @@ func (e *ExchangeMiddleware) Send(message Message) error {
 	if e.Channel.IsClosed() {
 		return ErrMessageMiddlewareDisconnected
 	}
-	for _, key := range e.Keys {
+	keys := e.Keys
+	if message.RoutingKey != "" {
+		keys = []string{message.RoutingKey} // routing específico
+	}
+	for _, key := range keys {
 		//si falla la key N, no se sabe cuantas de las 1..N-1 se enviaron bien
 		err := e.Channel.Publish(
 			e.Exchange,
