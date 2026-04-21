@@ -1,3 +1,31 @@
+# Informe
+
+Se realizaron distintas modificaciones sobre el esqueleto base provisto. 
+
+## Gateway
+
+La principal modificación viene en su message Handler, donde se genera un clientId aleatorio e interno(no se comparte con client) para mantener seguimiento de sus mensajes y poder escalarlo a cuando hayan varios clientes.
+
+Se mantiene un registro de los mensajes/frutas totales que comparte el cliente, la idea es que una vez tenemos su EoF, poder avisar a las demas entidades cuantos son los mensajes finales que corresponden a cada cliente.
+
+## Sum
+
+Se implementa un sistema de persistencia en disco para evitar cuellos de botella por  falta de memoria. La idea es que cada instancia de sum o aggregator tengan su propio storage para cada cliente, se maneja una logica de flusheo una vez se recibe EoF o se llega a un timeout desde el ultimo mensaje para ese cliente. La logica de timeout se agrega mas que nada para evitar sincronización entre todos los sums a la hora de hacer flusheo. Teniendo en cuenta que se trata de una cola Fifo, el timeout la mayoría de las veces llega luego de que un sum recibió EoF.
+
+Si llega a pasar de que un sum flusheo los datos de un client, pero terminar recibiendo nuevos mensajes de ese client, simplemente se vuelve a levantar el archivo y hacer una suma parcial. En aggregator se va a volver a acumular esa suma.
+
+El sum que recibe EoF broadcastea ese mensaje hacia todas las instancias de Aggregator.
+
+## Aggregator
+
+Se hace que el enrutamiento de mensajes desde sum se haga mediante discreción por frutas. Es decir, la fruta X siempre es procesada por Agg i que es calculado determinísticamente con una función de hashing. Cada aggregator realiza un top K parcial de las frutas con las que trabaja y luego se lo envía a Join.
+
+Los sums broadcastean el EoF de cada client, cuando Agg lo recibe, sabe que puede flushear ese storage y enviar los datos. Se agrega un timeout para evitar disparidades de los mensajes debido a latencia.
+
+La solución global va a ser optima por que cada aggregator muestra la mayor cantidad de ocurrencias entre un único e irrepetible grupo de frutas. Por ejemplo, entre manzana, banana,mango y pera. Si devuelve un top que no incluye a pera.
+
+
+
 # Trabajo Práctico - Coordinación
 
 En este trabajo se busca familiarizar a los estudiantes con los desafíos de la coordinación del trabajo y el control de la complejidad en sistemas distribuidos. Para tal fin se provee un esqueleto de un sistema de control de stock de una verdulería y un conjunto de escenarios de creciente grado de complejidad y distribución que demandarán mayor sofisticación en la comunicación de las partes involucradas.

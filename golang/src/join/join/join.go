@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"sort"
 	"sync"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -89,13 +91,15 @@ func (s *joinStorage) FlushAndClear(clientId string, fn func(joinBatch) error) e
 
 // me guardo las tasks que me van llegando y el total tasks cuando recibo EoF.
 type Join struct {
-	inputQueue  middleware.Middleware
-	outputQueue middleware.Middleware
-	storage     *joinStorage
-	tasksMu     sync.Mutex
-	accTasks    map[string]int
-	pendingEof  map[string]int
-	topAmount   int
+	inputQueue        middleware.Middleware
+	outputQueue       middleware.Middleware
+	storage           *joinStorage
+	tasksMu           sync.Mutex
+	accTasks          map[string]int
+	pendingEof        map[string]int
+	topAmount         int
+	eofCount          map[string]int //tengo que recibir todos los eof de los agg por cada client
+	aggregationAmount int
 }
 
 func NewJoin(config JoinConfig) (*Join, error) {
@@ -112,13 +116,22 @@ func NewJoin(config JoinConfig) (*Join, error) {
 		return nil, err
 	}
 
-	return &Join{inputQueue: inputQueue, outputQueue: outputQueue, storage: newJoinStorage(), topAmount: config.TopSize, accTasks: map[string]int{}, pendingEof: map[string]int{}}, nil
+	return &Join{inputQueue: inputQueue, outputQueue: outputQueue, storage: newJoinStorage(), topAmount: config.TopSize, accTasks: map[string]int{}, pendingEof: map[string]int{}, eofCount: map[string]int{}, aggregationAmount: config.AggregationAmount}, nil
 }
 
 func (join *Join) Run() {
+	go join.handleSignals()
 	join.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		join.handleMessage(msg, ack, nack)
 	})
+}
+
+func (join *Join) handleSignals() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	<-signals
+	slog.Info("SIGTERM received, stopping")
+	join.inputQueue.StopConsuming()
 }
 
 func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) {
@@ -156,9 +169,14 @@ func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func())
 }
 func (join *Join) handleEof(clientId string, totalTasks int) {
 	join.tasksMu.Lock()
+	join.eofCount[clientId]++
+	count := join.eofCount[clientId]
 	acc := join.accTasks[clientId]
 	join.tasksMu.Unlock()
-
+	if count < join.aggregationAmount {
+		//todavía no me llegaron los resultados de todos los aggs
+		return
+	}
 	if acc >= totalTasks {
 		join.processResult(clientId, totalTasks)
 	} else {
@@ -173,7 +191,7 @@ func (join *Join) processResult(clientId string, totalTasks int) {
 	//me borro de la existencia de ese client
 	join.tasksMu.Lock()
 	delete(join.accTasks, clientId)
-	delete(join.pendingEof, clientId)
+
 	join.tasksMu.Unlock()
 
 	// Generar top global a partir de todos los tops parciales

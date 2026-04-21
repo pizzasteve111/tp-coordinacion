@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"os/signal"
+	"syscall"
+
 	"log/slog"
 	"os"
 	"sync"
@@ -203,9 +206,18 @@ func NewSum(config SumConfig) (*Sum, error) {
 
 func (sum *Sum) Run() {
 	//habría que poner a consumir la output queue tambien
+	go sum.handleSignals()
 	sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		sum.handleMessage(msg, ack, nack)
 	})
+}
+
+func (sum *Sum) handleSignals() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	<-signals
+	slog.Info("SIGTERM received, stopping")
+	sum.inputQueue.StopConsuming()
 }
 
 func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
@@ -268,7 +280,7 @@ func (sum *Sum) flushClient(clientId string) {
 			slog.Error("While serializing flush message", "err", err)
 			return
 		}
-		msg.RoutingKey = sum.aggregationKeyFor(clientId)
+		msg.RoutingKey = sum.aggregationKeyFor(item.Fruit)
 		if err := sum.outputExchange.Send(*msg); err != nil {
 			slog.Error("While sending flush message", "err", err)
 			return
@@ -282,7 +294,6 @@ func (sum *Sum) sendEof(clientId string, totalTasks int) {
 		slog.Error("While serializing EOF", "err", err)
 		return
 	}
-	msg.RoutingKey = sum.aggregationKeyFor(clientId)
 	if err := sum.outputExchange.Send(*msg); err != nil {
 		slog.Error("While sending EOF", "err", err)
 	}
@@ -310,9 +321,9 @@ func (sum *Sum) cancelTimer(clientId string) {
 	}
 }
 
-func (sum *Sum) aggregationKeyFor(clientId string) string {
+func (sum *Sum) aggregationKeyFor(fruit string) string {
 	h := fnv.New32a()
-	h.Write([]byte(clientId))
+	h.Write([]byte(fruit))
 	idx := h.Sum32() % uint32(sum.aggAmount)
 	return fmt.Sprintf("%s_%d", sum.aggregationPrefix, idx)
 }
