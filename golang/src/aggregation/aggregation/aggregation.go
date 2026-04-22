@@ -101,13 +101,13 @@ type AggregationConfig struct {
 }
 
 type Aggregation struct {
-	outputQueue     middleware.Middleware
-	inputExchange   middleware.Middleware
-	topSize         int
-	storage         *aggStorage
-	timers          map[string]*time.Timer
-	timersMu        sync.Mutex
-	pendingEofTasks map[string]int
+	outputQueue   middleware.Middleware
+	inputExchange middleware.Middleware
+	topSize       int
+	storage       *aggStorage
+	eofCount      map[string]int
+	eofMu         sync.Mutex
+	sumAmount     int
 }
 
 func NewAggregation(config AggregationConfig) (*Aggregation, error) {
@@ -126,12 +126,10 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 	}
 
 	return &Aggregation{
-		outputQueue:     outputQueue,
-		inputExchange:   inputExchange,
-		topSize:         config.TopSize,
-		storage:         newAggStorage(config.Id),
-		timers:          map[string]*time.Timer{},
-		pendingEofTasks: map[string]int{},
+		outputQueue:   outputQueue,
+		inputExchange: inputExchange,
+		topSize:       config.TopSize,
+		storage:       newAggStorage(config.Id),
 	}, nil
 }
 
@@ -158,11 +156,19 @@ func (agg *Aggregation) handleMessage(msg middleware.Message, ack func(), nack f
 	}
 
 	if isEof {
-		agg.timersMu.Lock()
-		agg.pendingEofTasks[clientId] = totalTasks
-		agg.timersMu.Unlock()
-		agg.resetTimer(clientId)
-		agg.sendEof(clientId, totalTasks) // reenvía EOF a Join con totalTasks del gateway
+		agg.eofMu.Lock()
+		agg.eofCount[clientId]++
+		count := agg.eofCount[clientId]
+		if count >= agg.sumAmount {
+			delete(agg.eofCount, clientId)
+		}
+		agg.eofMu.Unlock()
+
+		if count < agg.sumAmount {
+			return // faltan EOFs de otros Sums
+		}
+		agg.flushClient(clientId)
+		agg.sendEof(clientId, totalTasks)
 		return
 	}
 
@@ -173,8 +179,6 @@ func (agg *Aggregation) handleMessage(msg middleware.Message, ack func(), nack f
 		slog.Error("While appending batch", "err", err)
 		return
 	}
-
-	agg.resetTimer(clientId)
 
 }
 
@@ -228,37 +232,4 @@ func (agg *Aggregation) buildFruitTop(aggregated map[string]fruititem.FruitItem)
 	})
 	finalTopSize := min(agg.topSize, len(fruitItems))
 	return fruitItems[:finalTopSize]
-}
-
-func (agg *Aggregation) resetTimer(clientId string) {
-	agg.timersMu.Lock()
-	defer agg.timersMu.Unlock()
-	if t, ok := agg.timers[clientId]; ok {
-		t.Stop()
-	}
-	agg.timers[clientId] = time.AfterFunc(aggFlushTimeout, func() {
-		//logica luego de los 10s del ultimo mensaje de un client
-		agg.timersMu.Lock()
-		_, hasPending := agg.pendingEofTasks[clientId]
-		if hasPending {
-			delete(agg.pendingEofTasks, clientId)
-		}
-		delete(agg.timers, clientId)
-		agg.timersMu.Unlock()
-
-		if !hasPending {
-			// Llegaron datos pero todavía no se recibió EOF: no flushear aún
-			return
-		}
-		agg.flushClient(clientId)
-	})
-}
-
-func (agg *Aggregation) cancelTimer(clientId string) {
-	agg.timersMu.Lock()
-	defer agg.timersMu.Unlock()
-	if t, ok := agg.timers[clientId]; ok {
-		t.Stop()
-		delete(agg.timers, clientId)
-	}
 }
