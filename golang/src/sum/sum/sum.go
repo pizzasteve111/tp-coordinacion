@@ -254,9 +254,16 @@ func (sum *Sum) handleSyncMessage(msg middleware.Message) {
 			total += t
 		}
 		expected, hasPending := sum.pendingEof[sm.ClientId]
+		shouldProcess := hasPending && total >= expected
+		if shouldProcess {
+			delete(sum.pendingEof, sm.ClientId)
+			delete(sum.readyCounts, sm.ClientId)
+			delete(sum.localTasks, sm.ClientId)
+		}
 		sum.mu.Unlock()
-		if hasPending && total >= expected {
-			sum.processSync(sm.ClientId, expected)
+		if shouldProcess {
+			sum.flushClient(sm.ClientId)
+			sum.sendEof(sm.ClientId, expected)
 		}
 	}
 }
@@ -272,14 +279,6 @@ func (sum *Sum) broadcastReady(clientId string) {
 	sum.syncPublisher.Send(middleware.Message{Body: string(body)})
 }
 
-func (sum *Sum) processSync(clientId string, totalTasks int) {
-	sum.syncMu.Lock()
-	delete(sum.pendingEof, clientId)
-	delete(sum.readyCounts, clientId)
-	delete(sum.localTasks, clientId)
-	sum.syncMu.Unlock()
-	sum.sendEof(clientId, totalTasks)
-}
 func (sum *Sum) handleSignals() {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)

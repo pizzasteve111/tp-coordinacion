@@ -194,8 +194,12 @@ func (agg *Aggregation) flushClient(clientId string) {
 		}
 		return nil
 	})
-	if err != nil || accumulatedTasks == 0 {
+	if err != nil {
 		return
+	}
+	if accumulatedTasks == 0 {
+		// no hay datos para enviar, pero igual continúa a sendEof
+		return // ← esto está bien porque sendEof se llama DESPUÉS de flushClient
 	}
 	//no debe descartar todas las ocurrencias de frutas que no llegan al top
 	top := agg.buildFruitTop(aggregated)

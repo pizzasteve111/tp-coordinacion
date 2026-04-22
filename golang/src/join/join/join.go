@@ -180,11 +180,7 @@ func (join *Join) handleEof(clientId string, totalTasks int) {
 	if acc >= totalTasks {
 		join.processResult(clientId, totalTasks)
 	} else {
-		join.tasksMu.Lock()
-		join.pendingEof[clientId] = totalTasks
-		join.tasksMu.Unlock()
-		slog.Info("EOF received before all data, waiting",
-			"clientId", clientId, "accumulated", acc, "expected", totalTasks)
+		join.pendingEof[clientId] = totalTasks // espera datos que quizás ya llegaron
 	}
 }
 func (join *Join) processResult(clientId string, totalTasks int) {
