@@ -80,9 +80,7 @@ func (s *sumStorage) Append(clientId string, items []fruititem.FruitItem) error 
 	if err != nil {
 		return err
 	}
-	if err := s.writeSumClient(clientId, append(existing, items...)); err != nil {
-		return err
-	}
+
 	return s.writeSumClient(clientId, append(existing, items...))
 
 }
@@ -201,14 +199,26 @@ func NewSum(config SumConfig) (*Sum, error) {
 	}
 	syncExchangeName := config.SumPrefix + "_sync"
 	syncPublisher, err := middleware.CreateExchangeMiddleware(syncExchangeName, allSumKeys, connSettings)
+	if err != nil {
+		inputQueue.Close()
+		outputExchange.Close()
+		return nil, err
+	}
 	ownKey := fmt.Sprintf("%s_%d", config.SumPrefix, config.Id)
 	syncConsumer, err := middleware.CreateExchangeMiddleware(syncExchangeName, []string{ownKey}, connSettings)
-
+	if err != nil {
+		inputQueue.Close()
+		outputExchange.Close()
+		syncPublisher.Close()
+		return nil, err
+	}
 	return &Sum{
 		inputQueue:        inputQueue,
 		outputExchange:    outputExchange,
 		fruitItemMap:      map[string]fruititem.FruitItem{},
 		storage:           newSumStorage(config.Id),
+		id:                config.Id,
+		sumAmount:         config.SumAmount,
 		aggAmount:         config.AggregationAmount,
 		aggregationPrefix: config.AggregationPrefix,
 		syncPublisher:     syncPublisher,
@@ -297,7 +307,6 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	}
 
 	if isEof {
-		sum.flushClient(clientId) // flush datos pendientes a Aggregation
 		sum.broadcastSyncEof(clientId, totalTasks)
 		return
 
@@ -305,6 +314,8 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	sum.mu.Lock()
 	if err := sum.storage.Append(clientId, fruitRecords); err != nil {
 		sum.mu.Unlock()
+		slog.Error("While appending to storage", "err", err)
+		return
 	}
 	sum.localTasks[clientId] += len(fruitRecords)
 	sum.mu.Unlock()
