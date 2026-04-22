@@ -17,6 +17,13 @@ import (
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
 )
 
+type syncMsg struct {
+	Type       string `json:"type"` // "eof" | "ready"
+	ClientId   string `json:"client_id"`
+	TotalTasks int    `json:"total_tasks,omitempty"` // solo en "eof"
+	SumId      int    `json:"sum_id,omitempty"`      // solo en "ready"
+	MyTasks    int    `json:"my_tasks,omitempty"`    // solo en "ready"
+}
 type SumConfig struct {
 	Id                int
 	MomHost           string
@@ -172,6 +179,14 @@ type Sum struct {
 	timersMu          sync.Mutex
 	aggAmount         int
 	aggregationPrefix string
+	id                int
+	sumAmount         int
+	syncPublisher     middleware.Middleware  // publica a todas las sums
+	syncConsumer      middleware.Middleware  // consume solo su propia key
+	localTasks        map[string]int         // clientId -> total acumulado de fruitRecords procesados
+	pendingEof        map[string]int         // clientId -> totalTasks (recibido por sync EOF)
+	readyCounts       map[string]map[int]int // clientId -> sumId -> myTasks
+	syncMu            sync.Mutex
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -192,6 +207,14 @@ func NewSum(config SumConfig) (*Sum, error) {
 		inputQueue.Close()
 		return nil, err
 	}
+	allSumKeys := make([]string, config.SumAmount)
+	for i := range config.SumAmount {
+		allSumKeys[i] = fmt.Sprintf("%s_%d", config.SumPrefix, i)
+	}
+	syncExchangeName := config.SumPrefix + "_sync"
+	syncPublisher, err := middleware.CreateExchangeMiddleware(syncExchangeName, allSumKeys, connSettings)
+	ownKey := fmt.Sprintf("%s_%d", config.SumPrefix, config.Id)
+	syncConsumer, err := middleware.CreateExchangeMiddleware(syncExchangeName, []string{ownKey}, connSettings)
 
 	return &Sum{
 		inputQueue:        inputQueue,
@@ -201,17 +224,79 @@ func NewSum(config SumConfig) (*Sum, error) {
 		timers:            map[string]*time.Timer{},
 		aggAmount:         config.AggregationAmount,
 		aggregationPrefix: config.AggregationPrefix,
+		syncPublisher:     syncPublisher,
+		syncConsumer:      syncConsumer,
+		localTasks:        map[string]int{}, pendingEof: map[string]int{}, readyCounts: map[string]map[int]int{},
 	}, nil
 }
 
 func (sum *Sum) Run() {
 	//habría que poner a consumir la output queue tambien
 	go sum.handleSignals()
+	go sum.consumeSync()
 	sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		sum.handleMessage(msg, ack, nack)
 	})
 }
 
+func (sum *Sum) consumeSync() {
+	sum.syncConsumer.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+		defer ack()
+		sum.handleSyncMessage(msg)
+	})
+}
+func (sum *Sum) handleSyncMessage(msg middleware.Message) {
+	var sm syncMsg
+	if err := json.Unmarshal([]byte(msg.Body), &sm); err != nil {
+		return
+	}
+	switch sm.Type {
+	case "eof":
+		sum.syncMu.Lock()
+		sum.pendingEof[sm.ClientId] = sm.TotalTasks
+		_, timerRunning := sum.timers[sm.ClientId]
+		sum.syncMu.Unlock()
+		if !timerRunning {
+			// 0 tareas para este cliente, listo de inmediato
+			sum.broadcastReady(sm.ClientId)
+		}
+	case "ready":
+		sum.syncMu.Lock()
+		if sum.readyCounts[sm.ClientId] == nil {
+			sum.readyCounts[sm.ClientId] = map[int]int{}
+		}
+		sum.readyCounts[sm.ClientId][sm.SumId] = sm.MyTasks
+		total := 0
+		for _, t := range sum.readyCounts[sm.ClientId] {
+			total += t
+		}
+		expected, hasPending := sum.pendingEof[sm.ClientId]
+		sum.syncMu.Unlock()
+		if hasPending && total >= expected {
+			sum.processSync(sm.ClientId, expected)
+		}
+	}
+}
+func (sum *Sum) broadcastSyncEof(clientId string, totalTasks int) {
+	body, _ := json.Marshal(syncMsg{Type: "eof", ClientId: clientId, TotalTasks: totalTasks})
+	sum.syncPublisher.Send(middleware.Message{Body: string(body)})
+}
+func (sum *Sum) broadcastReady(clientId string) {
+	sum.syncMu.Lock()
+	myTasks := sum.localTasks[clientId]
+	sum.syncMu.Unlock()
+	body, _ := json.Marshal(syncMsg{Type: "ready", ClientId: clientId, SumId: sum.id, MyTasks: myTasks})
+	sum.syncPublisher.Send(middleware.Message{Body: string(body)})
+}
+
+func (sum *Sum) processSync(clientId string, totalTasks int) {
+	sum.syncMu.Lock()
+	delete(sum.pendingEof, clientId)
+	delete(sum.readyCounts, clientId)
+	delete(sum.localTasks, clientId)
+	sum.syncMu.Unlock()
+	sum.sendEof(clientId, totalTasks)
+}
 func (sum *Sum) handleSignals() {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
@@ -231,9 +316,10 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 
 	if isEof {
 		sum.cancelTimer(clientId)
-		sum.flushClient(clientId)         // flush lo que quedó
-		sum.sendEof(clientId, totalTasks) // propaga EOF con total del gateway
+		sum.flushClient(clientId) // flush datos pendientes a Aggregation
+		sum.broadcastSyncEof(clientId, totalTasks)
 		return
+
 	}
 	fileSize, err := sum.storage.Append(clientId, fruitRecords)
 	if err != nil {
@@ -309,6 +395,13 @@ func (sum *Sum) resetTimer(clientId string) {
 	sum.timers[clientId] = time.AfterFunc(flushTimeout, func() {
 		sum.cancelTimer(clientId)
 		sum.flushClient(clientId)
+		sum.syncMu.Lock()
+		_, hasPending := sum.pendingEof[clientId]
+		sum.syncMu.Unlock()
+		if hasPending {
+			sum.broadcastReady(clientId)
+		}
+
 	})
 }
 
