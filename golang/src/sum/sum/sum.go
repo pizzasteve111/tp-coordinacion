@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -34,13 +33,6 @@ type SumConfig struct {
 	AggregationAmount int
 	AggregationPrefix string
 }
-
-const (
-	flushTimeout = 10 * time.Second
-	maxFileSize  = 10 * 1024 * 1024
-)
-
-//logica de storage de sum. Un directorio por sum con N storages por client y sum.
 
 type sumStorage struct {
 	mu      sync.Mutex
@@ -81,21 +73,18 @@ func (s *sumStorage) writeSumClient(clientId string, items []fruititem.FruitItem
 }
 
 // devuelve el tamaño del archivo así sabemos si hay que mandar a flushear
-func (s *sumStorage) Append(clientId string, items []fruititem.FruitItem) (int64, error) {
+func (s *sumStorage) Append(clientId string, items []fruititem.FruitItem) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	existing, err := s.readSumClient(clientId)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	if err := s.writeSumClient(clientId, append(existing, items...)); err != nil {
-		return 0, err
+		return err
 	}
-	info, err := os.Stat(s.filePath(clientId))
-	if err != nil {
-		return 0, err
-	}
-	return info.Size(), nil
+	return s.writeSumClient(clientId, append(existing, items...))
+
 }
 
 // quiero iterar el storage de un client sin tener que levantar todo en memoria, itero y descarto.
@@ -175,8 +164,7 @@ type Sum struct {
 	outputExchange    middleware.Middleware
 	fruitItemMap      map[string]fruititem.FruitItem
 	storage           *sumStorage
-	timers            map[string]*time.Timer
-	timersMu          sync.Mutex
+	mu                sync.Mutex
 	aggAmount         int
 	aggregationPrefix string
 	id                int
@@ -221,7 +209,6 @@ func NewSum(config SumConfig) (*Sum, error) {
 		outputExchange:    outputExchange,
 		fruitItemMap:      map[string]fruititem.FruitItem{},
 		storage:           newSumStorage(config.Id),
-		timers:            map[string]*time.Timer{},
 		aggAmount:         config.AggregationAmount,
 		aggregationPrefix: config.AggregationPrefix,
 		syncPublisher:     syncPublisher,
@@ -252,16 +239,12 @@ func (sum *Sum) handleSyncMessage(msg middleware.Message) {
 	}
 	switch sm.Type {
 	case "eof":
-		sum.syncMu.Lock()
+		sum.mu.Lock()
 		sum.pendingEof[sm.ClientId] = sm.TotalTasks
-		_, timerRunning := sum.timers[sm.ClientId]
-		sum.syncMu.Unlock()
-		if !timerRunning {
-			// 0 tareas para este cliente, listo de inmediato
-			sum.broadcastReady(sm.ClientId)
-		}
+		sum.mu.Unlock()
+		sum.broadcastReady(sm.ClientId)
 	case "ready":
-		sum.syncMu.Lock()
+		sum.mu.Lock()
 		if sum.readyCounts[sm.ClientId] == nil {
 			sum.readyCounts[sm.ClientId] = map[int]int{}
 		}
@@ -271,7 +254,7 @@ func (sum *Sum) handleSyncMessage(msg middleware.Message) {
 			total += t
 		}
 		expected, hasPending := sum.pendingEof[sm.ClientId]
-		sum.syncMu.Unlock()
+		sum.mu.Unlock()
 		if hasPending && total >= expected {
 			sum.processSync(sm.ClientId, expected)
 		}
@@ -282,9 +265,9 @@ func (sum *Sum) broadcastSyncEof(clientId string, totalTasks int) {
 	sum.syncPublisher.Send(middleware.Message{Body: string(body)})
 }
 func (sum *Sum) broadcastReady(clientId string) {
-	sum.syncMu.Lock()
+	sum.mu.Lock()
 	myTasks := sum.localTasks[clientId]
-	sum.syncMu.Unlock()
+	sum.mu.Unlock()
 	body, _ := json.Marshal(syncMsg{Type: "ready", ClientId: clientId, SumId: sum.id, MyTasks: myTasks})
 	sum.syncPublisher.Send(middleware.Message{Body: string(body)})
 }
@@ -315,24 +298,17 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	}
 
 	if isEof {
-		sum.cancelTimer(clientId)
 		sum.flushClient(clientId) // flush datos pendientes a Aggregation
 		sum.broadcastSyncEof(clientId, totalTasks)
 		return
 
 	}
-	fileSize, err := sum.storage.Append(clientId, fruitRecords)
-	if err != nil {
-		slog.Error("While appending to storage", "err", err)
-		return
+	sum.mu.Lock()
+	if err := sum.storage.Append(clientId, fruitRecords); err != nil {
+		sum.mu.Unlock()
 	}
-	//tiene que verificar si no se paso el timeout
-	if fileSize >= maxFileSize {
-		sum.cancelTimer(clientId)
-		sum.flushClient(clientId)
-	} else {
-		sum.resetTimer(clientId)
-	}
+	sum.localTasks[clientId] += len(fruitRecords)
+	sum.mu.Unlock()
 
 }
 
@@ -382,35 +358,6 @@ func (sum *Sum) sendEof(clientId string, totalTasks int) {
 	}
 	if err := sum.outputExchange.Send(*msg); err != nil {
 		slog.Error("While sending EOF", "err", err)
-	}
-}
-
-func (sum *Sum) resetTimer(clientId string) {
-	sum.timersMu.Lock()
-	defer sum.timersMu.Unlock()
-	if t, ok := sum.timers[clientId]; ok {
-		t.Stop()
-	}
-	//despues del timeout, llamo a flushear
-	sum.timers[clientId] = time.AfterFunc(flushTimeout, func() {
-		sum.cancelTimer(clientId)
-		sum.flushClient(clientId)
-		sum.syncMu.Lock()
-		_, hasPending := sum.pendingEof[clientId]
-		sum.syncMu.Unlock()
-		if hasPending {
-			sum.broadcastReady(clientId)
-		}
-
-	})
-}
-
-func (sum *Sum) cancelTimer(clientId string) {
-	sum.timersMu.Lock()
-	defer sum.timersMu.Unlock()
-	if t, ok := sum.timers[clientId]; ok {
-		t.Stop()
-		delete(sum.timers, clientId)
 	}
 }
 
