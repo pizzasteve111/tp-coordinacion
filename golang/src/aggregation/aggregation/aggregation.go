@@ -9,15 +9,10 @@ import (
 	"sort"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
-)
-
-const (
-	aggFlushTimeout = 10 * time.Second
 )
 
 // el resultado que recibo de sum, las ocurrencias de X frutas y las N tasks originales que corresponde a ese resultado.
@@ -130,6 +125,8 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 		inputExchange: inputExchange,
 		topSize:       config.TopSize,
 		storage:       newAggStorage(config.Id),
+		eofCount:      map[string]int{},
+		sumAmount:     config.SumAmount,
 	}, nil
 }
 
