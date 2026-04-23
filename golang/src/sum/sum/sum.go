@@ -49,82 +49,35 @@ func (s *sumStorage) filePath(clientId string) string {
 	return fmt.Sprintf("%s/%s.json", s.dirPath, clientId)
 }
 
-func (s *sumStorage) readSumClient(clientId string) ([]fruititem.FruitItem, error) {
-	result := []fruititem.FruitItem{}
-	data, err := os.ReadFile(s.filePath(clientId))
-	if os.IsNotExist(err) {
-		return result, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if err := json.Unmarshal(data, &result); err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
-func (s *sumStorage) writeSumClient(clientId string, items []fruititem.FruitItem) error {
-	bytes, err := json.Marshal(items)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(s.filePath(clientId), bytes, 0644)
-}
-
 // devuelve el tamaño del archivo así sabemos si hay que mandar a flushear
 func (s *sumStorage) Append(clientId string, items []fruititem.FruitItem) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	existing, err := s.readSumClient(clientId)
-	if err != nil {
-		return err
-	}
-
-	return s.writeSumClient(clientId, append(existing, items...))
-
-}
-
-// quiero iterar el storage de un client sin tener que levantar todo en memoria, itero y descarto.
-func (s *sumStorage) ForEach(clientId string, fn func(fruititem.FruitItem) error) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	f, err := os.Open(s.filePath(clientId))
-	if os.IsNotExist(err) {
-		return nil
-	}
+	f, err := os.OpenFile(s.filePath(clientId), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-
-	dec := json.NewDecoder(f)
-
-	if _, err := dec.Token(); err != nil { // consume el '['
-		return err
-	}
-	for dec.More() {
-		var item fruititem.FruitItem
-		if err := dec.Decode(&item); err != nil {
+	for _, item := range items {
+		line, err := json.Marshal(item)
+		if err != nil {
 			return err
 		}
-		if err := fn(item); err != nil {
+		if _, err = f.Write(append(line, '\n')); err != nil {
 			return err
 		}
-	}
-	if _, err := dec.Token(); err != nil {
-		return err
 	}
 	return nil
+
 }
+
 func (s *sumStorage) Delete(clientId string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return os.Remove(s.filePath(clientId))
 }
 
-// función para limpiar archivos
+// función para limpiar archivos y no cargar en memoria todo
 func (s *sumStorage) FlushAndClear(clientId string, fn func(fruititem.FruitItem) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -136,10 +89,6 @@ func (s *sumStorage) FlushAndClear(clientId string, fn func(fruititem.FruitItem)
 		return err
 	}
 	dec := json.NewDecoder(f)
-	if _, err := dec.Token(); err != nil { // consume '['
-		f.Close()
-		return err
-	}
 	for dec.More() {
 		var item fruititem.FruitItem
 		if err := dec.Decode(&item); err != nil {
@@ -156,9 +105,8 @@ func (s *sumStorage) FlushAndClear(clientId string, fn func(fruititem.FruitItem)
 }
 
 type Sum struct {
-	//esto para cuando escalemos a varios sums
 	inputQueue middleware.Middleware
-	//por este exchange los sums reciben EoF de client x
+
 	outputExchange    middleware.Middleware
 	fruitItemMap      map[string]fruititem.FruitItem
 	storage           *sumStorage
@@ -167,11 +115,11 @@ type Sum struct {
 	aggregationPrefix string
 	id                int
 	sumAmount         int
-	syncPublisher     middleware.Middleware  // publica a todas las sums
-	syncConsumer      middleware.Middleware  // consume solo su propia key
-	localTasks        map[string]int         // clientId -> total acumulado de fruitRecords procesados
-	pendingEof        map[string]int         // clientId -> totalTasks (recibido por sync EOF)
-	readyCounts       map[string]map[int]int // clientId -> sumId -> myTasks
+	syncPublisher     middleware.Middleware
+	syncConsumer      middleware.Middleware
+	localTasks        map[string]int
+	pendingEof        map[string]int
+	readyCounts       map[string]map[int]int
 	syncMu            sync.Mutex
 }
 

@@ -39,20 +39,17 @@ func (s *aggStorage) filePath(clientId string) string {
 func (s *aggStorage) AppendBatch(clientId string, batch aggBatch) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	existing := []aggBatch{}
-	data, err := os.ReadFile(s.filePath(clientId))
-	if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	if len(data) > 0 {
-		json.Unmarshal(data, &existing)
-	}
-	existing = append(existing, batch)
-	bytes, err := json.Marshal(existing)
+	f, err := os.OpenFile(s.filePath(clientId), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.filePath(clientId), bytes, 0644)
+	defer f.Close()
+	line, err := json.Marshal(batch)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(append(line, '\n'))
+	return err
 
 }
 
@@ -67,7 +64,6 @@ func (s *aggStorage) FlushAndClear(clientId string, fn func(aggBatch) error) err
 		return err
 	}
 	dec := json.NewDecoder(f)
-	dec.Token() // consume '['
 	for dec.More() {
 		var batch aggBatch
 		if err := dec.Decode(&batch); err != nil {
@@ -79,6 +75,7 @@ func (s *aggStorage) FlushAndClear(clientId string, fn func(aggBatch) error) err
 			return err
 		}
 	}
+
 	f.Close()
 	return os.Remove(s.filePath(clientId))
 }
@@ -198,10 +195,9 @@ func (agg *Aggregation) flushClient(clientId string) {
 		return
 	}
 	if accumulatedTasks == 0 {
-		// no hay datos para enviar, pero igual continúa a sendEof
-		return // ← esto está bien porque sendEof se llama DESPUÉS de flushClient
+
+		return
 	}
-	//no debe descartar todas las ocurrencias de frutas que no llegan al top
 	top := agg.buildFruitTop(aggregated)
 
 	msg, err := inner.SerializeMessage(top, clientId, accumulatedTasks)

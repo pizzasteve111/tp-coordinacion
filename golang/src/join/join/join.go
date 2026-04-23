@@ -148,7 +148,6 @@ func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func())
 		return
 	}
 
-	// Guardar el batch parcial del cliente
 	if err := join.storage.AppendBatch(clientId, joinBatch{
 		Tasks:  totalTasks,
 		Fruits: fruits,
@@ -174,23 +173,21 @@ func (join *Join) handleEof(clientId string, totalTasks int) {
 	acc := join.accTasks[clientId]
 	join.tasksMu.Unlock()
 	if count < join.aggregationAmount {
-		//todavía no me llegaron los resultados de todos los aggs
+
 		return
 	}
 	if acc >= totalTasks {
 		join.processResult(clientId, totalTasks)
 	} else {
-		join.pendingEof[clientId] = totalTasks // espera datos que quizás ya llegaron
+		join.pendingEof[clientId] = totalTasks
 	}
 }
 func (join *Join) processResult(clientId string, totalTasks int) {
-	//me borro de la existencia de ese client
 	join.tasksMu.Lock()
 	delete(join.accTasks, clientId)
 
 	join.tasksMu.Unlock()
 
-	// Generar top global a partir de todos los tops parciales
 	aggregated := map[string]fruititem.FruitItem{}
 	err := join.storage.FlushAndClear(clientId, func(batch joinBatch) error {
 		for _, fruit := range batch.Fruits {
@@ -213,13 +210,12 @@ func (join *Join) processResult(clientId string, totalTasks int) {
 		fruits = append(fruits, item)
 	}
 	sort.Slice(fruits, func(i, j int) bool {
-		return fruits[j].Less(fruits[i]) // descendente por Amount
+		return fruits[j].Less(fruits[i])
 	})
 	if len(fruits) > join.topAmount {
 		fruits = fruits[:join.topAmount]
 	}
 
-	// Enviar resultado al gateway con clientId para que rutee al cliente correcto
 	msg, err := inner.SerializeMessage(fruits, clientId, totalTasks)
 	if err != nil {
 		slog.Error("While serializing top", "err", err)

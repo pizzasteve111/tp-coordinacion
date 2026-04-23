@@ -10,21 +10,26 @@ Se mantiene un registro de los mensajes/frutas totales que comparte el cliente, 
 
 ## Sum
 
-Se implementa un sistema de persistencia en disco para evitar cuellos de botella por  falta de memoria. La idea es que cada instancia de sum o aggregator tengan su propio storage para cada cliente, se maneja una logica de flusheo una vez se recibe EoF o se llega a un timeout desde el ultimo mensaje para ese cliente. La logica de timeout se agrega mas que nada para evitar sincronización entre todos los sums a la hora de hacer flusheo. Teniendo en cuenta que se trata de una cola Fifo, el timeout la mayoría de las veces llega luego de que un sum recibió EoF.
+Se implementa un sistema de persistencia en disco para evitar cuellos de botella por  falta de memoria. La idea es que cada instancia de sum o aggregator tengan su propio storage para cada cliente, cuando una instancia Sum recibe el Eof de gateway, lo que hace es broadcastear por un middleware hacia todos los otros sums, indicando la totalidad de mensajes que envió ese cliente. Este canal se consume en una go routine a parte al input/output que ya se tiene, el procesamiento es accedido mediante un lock.
 
-Si llega a pasar de que un sum flusheo los datos de un client, pero terminar recibiendo nuevos mensajes de ese client, simplemente se vuelve a levantar el archivo y hacer una suma parcial. En aggregator se va a volver a acumular esa suma.
+Todos los sums al recibir el eof lo que hacen es compartir cuantas tasks procesaron de ese cliente, si ven que en la totalidad de la distribución ya tienen el total de mensajes de un client, cada una genera suma y la envía a aggregator.  Ejemplo: Sum1 publica que tiene 35 de las 100 tareas de client X, sum2 que hizo otras 35 y sum 3 que hizo otras 30, al enterarse ven que ya se llegó a cien y mandan sus resultados
 
-El sum que recibe EoF broadcastea ese mensaje hacia todas las instancias de Aggregator.
 
 ## Aggregator
 
 Se hace que el enrutamiento de mensajes desde sum se haga mediante discreción por frutas. Es decir, la fruta X siempre es procesada por Agg i que es calculado determinísticamente con una función de hashing. Cada aggregator realiza un top K parcial de las frutas con las que trabaja y luego se lo envía a Join.
 
-Los sums broadcastean el EoF de cada client, cuando Agg lo recibe, sabe que puede flushear ese storage y enviar los datos. Se agrega un timeout para evitar disparidades de los mensajes debido a latencia.
 
 La solución global va a ser optima por que cada aggregator muestra la mayor cantidad de ocurrencias entre un único e irrepetible grupo de frutas. Por ejemplo, entre manzana, banana,mango y pera. Si devuelve un top que no incluye a pera.
 
 
+## Join
+
+Espera a recibir los mensajes de todos los aggregators para con un client. Además mantiene un seguimiento de los total tasks por client. Una vez le llegan todos los eof/resultados de aggregator, ahí genera un top global en base a los parciales. El cual es óptimo y determinístico ya que cada top parcial es en base a un grupo único de frutas
+
+## Storage
+
+La lógica de storage busca que no se mantenga en memoria muchos datos, a la hora de procesar un archivo, se busca que se itere y consuma a la vez. Me terminó quedando un poco de código repetido en las tres implementaciones, como en clase se dijo que al final no era necesario ocuparse de esto, no le terminé dando el tiempo necesario para refactorizarlo
 
 # Trabajo Práctico - Coordinación
 
